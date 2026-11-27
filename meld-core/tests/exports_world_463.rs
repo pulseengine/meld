@@ -104,6 +104,7 @@ fn world_exports() -> BTreeSet<String> {
     ])
 }
 
+// rivet: verifies SWV-112
 #[test]
 fn the_default_keeps_every_inner_export() {
     // Control: without the flag the export surface is exactly what it was.
@@ -145,6 +146,7 @@ fn a_default_config_is_the_all_policy() {
     );
 }
 
+// rivet: verifies SWV-112
 #[test]
 fn world_keeps_exactly_the_outer_interfaces_and_what_they_need() {
     let fused = fuse("composed.wasm", config(ExportPolicy::World, false)).expect("fuses");
@@ -464,6 +466,7 @@ fn run_unfused() -> [f32; 4] {
     out
 }
 
+// rivet: verifies SWV-112
 #[test]
 fn the_world_pruned_module_computes_what_the_unfused_composition_computes() {
     let unfused = run_unfused();
@@ -849,6 +852,7 @@ fn module_imports(wasm: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+// rivet: verifies SWV-112
 #[test]
 fn across_the_whole_corpus_a_world_keeps_what_its_imports_and_resources_need() {
     // Every wit-bindgen fixture, fused under `world`. The oracle is the INPUT
@@ -1167,6 +1171,7 @@ const P3_BUILTIN_NAMES_A_MEMORY: &str = r#"
 )
 "#;
 
+// rivet: verifies SWV-112
 #[test]
 fn a_p3_builtin_that_names_a_memory_keeps_it_and_an_async_lift_keeps_its_abi_names() {
     let bytes = wat::parse_str(P3_BUILTIN_NAMES_A_MEMORY).expect("wat parses");
