@@ -4307,3 +4307,21 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-25T03:30:00Z
+
+  - id: SR-141
+    type: sw-req
+    title: "The attestation's output.hash covers every byte of the output except the attestation section"
+    status: implemented
+    release: v0.72.0
+    description: "Refines SR-30 (#699, sigil#396 option A). meld shall build every other metadata section (component-provenance, meld.signature-manifest, pulseengine:async-edges) before the attestation, compute output.hash and output.size over the complete module without the attestation, and append exactly one wsc.transformation.attestation section as the last section of the output, so that removing that one section and re-serializing the module with minimal-LEB128 section sizes, as wsc's verify_attestation_binds_module does, yields the hashed bytes. A change to any other byte, metadata included, shall fail that binding. Provenance's fused_module_sha256 keeps covering the module without meld's metadata sections."
+    links:
+      - type: derives-from
+        target: SYS-10
+      - type: refines
+        target: SR-30
+      - type: mitigates
+        target: H-6
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-27T14:00:00Z

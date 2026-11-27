@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
 - CI job `meld.wasm component`: builds meld-cli for wasm32-wasip2 and runs it under wasmtime 41. meld.wasm fuses five wit-bindgen fixtures and itself with `--reproducible`, and each output must equal native meld's byte for byte. Two planted controls (different inputs; one flipped byte) must compare unequal, and exit codes must match native (0 / 2 / 1). meld.wasm is uploaded as a build artifact.
 - Releases carry `meld-<tag>-wasm32-wasip2.wasm`, meld built as a WASI 0.2 component (#697). It is smoke-tested under wasmtime 41 (`--version` must print the tag), listed in the cosign-signed `SHA256SUMS.txt`, covered by the SLSA provenance, and required by the release-assets gate.
 
+### Changed
+
+- The attestation's `output.hash` now covers every byte of the output except the attestation section itself (#699, sigil#396). Before, it covered the module without `component-provenance` and `meld.signature-manifest` as well, so `wsc verify-chain` could not bind a meld output and nothing bound the two sections that kiln, scry and hosts read. meld now builds provenance and the signature manifest first, hashes the module with them, and appends one `wsc.transformation.attestation` section last. Removing that section gives back exactly the hashed bytes, which is how wsc recomputes the hash. This changes `output.hash`, `output.size` and the attestation bytes of every output. Provenance's `fused_module_sha256` is unchanged and still covers the module without meld's metadata sections.
+
 ### Fixed
 
 - `component-provenance` no longer depends on the host word size. A fully synthetic function's sentinel index was formatted as `usize`, so meld.wasm wrote `component-4294967295` where native meld writes `component-18446744073709551615`, and `--reproducible` gave different bytes on 32- and 64-bit hosts. It is now always the `u64::MAX` form; 64-bit output is byte-identical to v0.71.0.

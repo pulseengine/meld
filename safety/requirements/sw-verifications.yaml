@@ -2198,3 +2198,17 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-25T05:00:00Z
+
+  - id: SWV-151
+    type: sw-verification
+    title: "Verification of SR-141: output.hash binds provenance and the signature manifest"
+    status: verified
+    release: v0.72.0
+    description: "meld-core/tests/attestation_binding.rs fuses lists.wasm with attestation, provenance and the signature manifest on, with and without --reproducible, in both the default and the attestation-feature build. output_hash_covers_everything_but_the_attestation: both metadata sections are present once, the attestation is present once and is the last section, and output.hash equals a recomputation written from wsc's procedure (remove the first attestation section, re-serialize with minimal-LEB128 sizes, SHA-256). a_changed_metadata_or_code_byte_breaks_the_binding: one flipped byte in component-provenance, meld.signature-manifest or the code section changes the recomputed hash. Negative control: with meld-core/src/lib.rs from v0.71.0 both tests fail."
+    links:
+      - type: verifies
+        target: SR-141
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-27T14:00:00Z
