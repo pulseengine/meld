@@ -214,10 +214,59 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
+  # ── meld as a wasip2 component (#697) ─────────────────────────────────
+  # A bare meld.wasm asset, so a component host (kiln) can run meld without
+  # a native binary. It enters SHA256SUMS.txt (cosign-signed) and the SLSA
+  # provenance like every archive. ci.yml's `meld.wasm component` job holds
+  # its output byte-identical to native meld's on every PR.
+  build-wasm:
+    name: Build wasm32-wasip2 component
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, toolchain pinned
+        with:
+          toolchain: 1.100.0
+          targets: wasm32-wasip2
+
+      - name: Install wasmtime
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: wasmtime@41.0.0
+
+      - name: Build meld.wasm
+        run: cargo build --locked --release -p meld-cli --target wasm32-wasip2
+
+      - name: Smoke-test and package meld.wasm
+        id: package
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          WASM=target/wasm32-wasip2/release/meld.wasm
+          out=$(wasmtime run -S cli-exit-with-code=y "$WASM" --version)
+          echo "$out"
+          [ "$out" = "meld ${VERSION#v}" ] || { echo "::error::meld.wasm --version printed '$out', expected 'meld ${VERSION#v}'"; exit 1; }
+          mkdir -p dist
+          cp "$WASM" "dist/meld-${VERSION}-wasm32-wasip2.wasm"
+          echo "asset=dist/meld-${VERSION}-wasm32-wasip2.wasm" >> "$GITHUB_OUTPUT"
+
+      - name: Upload meld.wasm artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: meld-wasm32-wasip2
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
   # ── Create the GitHub Release: SBOM, checksums, provenance, signing ────
   create-release:
     name: Create GitHub Release
-    needs: [build-binaries]
+    needs: [build-binaries, build-wasm]
     runs-on: ubuntu-24.04
     permissions:
       # Keyless signing + provenance need an OIDC token; release-asset
@@ -242,6 +291,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find artifacts -type f -name "*.tar.gz" -exec cp {} release-assets/ \;
+          find artifacts -type f -name "*-wasm32-wasip2.wasm" -exec cp {} release-assets/ \;
           ls -la release-assets/
 
       # Phase 6: CycloneDX SBOM for the meld toolchain itself. The SBOM
@@ -329,7 +379,9 @@ jobs:
       - name: Generate SLSA build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: "release-assets/*.tar.gz"
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*-wasm32-wasip2.wasm
 
       # ── Sigstore keyless signing (cosign) ──────────────────────────────
       # Signs SHA256SUMS.txt so a consumer can verify the checksum file

@@ -67,6 +67,19 @@ tar xzf "meld-${TAG}-${TARGET}.tar.gz"
 Verify what you downloaded before running it — see
 [Verifying a Release](#verifying-a-release).
 
+### As a WebAssembly component
+
+From the first release after v0.71.0, each release also carries
+`meld-<tag>-wasm32-wasip2.wasm`: meld built as a WASI 0.2 component. It is
+listed in the signed `SHA256SUMS.txt`, and CI holds its output byte-identical
+to native meld's under `--reproducible`. wasmtime 41 needs
+`-S cli-exit-with-code=y`, and file arguments must be inside a `--dir`:
+
+```bash
+wasmtime run -S cli-exit-with-code=y --dir .::/w meld-${TAG}-wasm32-wasip2.wasm \
+  fuse --reproducible /w/app.wasm -o /w/app.fused.wasm
+```
+
 ### From source
 
 ```bash
