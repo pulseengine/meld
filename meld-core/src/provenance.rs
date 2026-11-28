@@ -280,7 +280,7 @@ pub fn fused_is_closed_world(module_bytes: &[u8]) -> bool {
 
 /// Compute the SHA-256 hex digest of the given bytes. Lower-case hex,
 /// no leading `0x`, 64 chars — same format as
-/// [`crate::attestation::build_wsc_attestation`].
+/// `crate::attestation::compute_sha256`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

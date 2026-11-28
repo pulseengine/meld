@@ -64,8 +64,8 @@ type AttestedInput = (String, String, u64, Option<u64>);
 
 /// (name, hash, size, module_count) for each attested input.
 ///
-/// `module_count` is `Option` on purpose: the wsc attestation schema (the
-/// optional `attestation` feature) has no such field. An earlier version used
+/// `module_count` is `Option` on purpose: it must be recorded, by the default
+/// schema on the input and by the wsc schema (#709) in `metadata.inputs`. An earlier version used
 /// `.unwrap_or(0)`, which silently turned "field absent" into "zero modules" —
 /// a default standing in for a measurement.
 fn attested_inputs(att: &serde_json::Value) -> Vec<AttestedInput> {
@@ -73,12 +73,17 @@ fn attested_inputs(att: &serde_json::Value) -> Vec<AttestedInput> {
         .as_array()
         .expect("inputs[] array")
         .iter()
-        .map(|i| {
+        .enumerate()
+        .map(|(n, i)| {
             (
                 i["artifact"]["name"].as_str().unwrap_or("").to_string(),
                 i["artifact"]["hash"].as_str().unwrap_or("").to_string(),
                 i["artifact"]["size"].as_u64().unwrap_or(0),
-                i.get("module_count").and_then(|m| m.as_u64()),
+                // The default schema records it on the input; the wsc schema
+                // (#709) in `metadata.inputs`, in input order.
+                i.get("module_count")
+                    .or_else(|| att["metadata"]["inputs"].get(n)?.get("module_count"))
+                    .and_then(|m| m.as_u64()),
             )
         })
         .collect()
@@ -180,26 +185,15 @@ fn input_size_is_the_bytes_the_caller_passed() {
 /// Collapsing phantoms must not LOSE modules. A nested input's modules are
 /// spread across its flattened children; the per-input count must sum them.
 ///
-/// The two attestation schemas differ here, and this test asserts the truth of
-/// each rather than compiling itself out of one (the pattern #408 reports). The
-/// default schema records `module_count`, which must account for every merged
-/// module. The wsc schema has no such field — asserted ABSENT, so if it is ever
-/// added this fails and forces the count to be checked there too.
+/// Both attestation schemas record the count (the wsc schema in
+/// `metadata.inputs` since #709), and in both it must account for every merged
+/// module.
 // rivet: verifies SR-75
 #[test]
 fn attested_module_counts_account_for_every_merged_module() {
     for inputs in [composed(), two_flat_files()] {
         let (stats, attested) = run(&inputs, false);
         let counts: Vec<Option<u64>> = attested.iter().map(|(_, _, _, m)| *m).collect();
-
-        if cfg!(feature = "attestation") {
-            assert!(
-                counts.iter().all(Option::is_none),
-                "the wsc schema was believed to carry no module_count; it now does, so \
-                 check the per-input counts on this path too: {counts:?}"
-            );
-            continue;
-        }
 
         let counts: Vec<u64> = counts
             .into_iter()
