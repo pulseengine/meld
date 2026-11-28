@@ -4218,7 +4218,7 @@ artifacts:
     type: sw-req
     title: "No differential row is silently wrong, and an outsider can re-derive the ledger"
     status: draft
-    release: v0.73.0
+    release: v0.74.0
     description: "Serves North Star O3 (summary; indicator unmoved). Every Canonical ABI differential row that is wrong or accepts-invalid moves to match, match-trap or a loud refusal (wrong 20 -> 0, accepts-invalid 30 -> 0 from main 370d82b). The deliberate fused-trap rows form a capped list of at most 8 that may only shrink. A re-check kit (fixtures, ledger, one script) ships as a signed release asset. Negative controls: the kit reports drift against v0.69.0, and a planted wrong ledger row fails the job. Plan: docs/plans/v0.71.0.md, bet 1."
     links:
       - type: derives-from
@@ -4244,7 +4244,7 @@ artifacts:
     type: sw-req
     title: "The upstream component-model WAST suite runs as a required check with host imports"
     status: draft
-    release: v0.73.0
+    release: v0.74.0
     description: "Serves North Star O3 (summary; indicator unmoved; external corpus). A host-import harness lets the imports commands execute (266 not executed -> at most 60), and cm_wast_ratchet becomes a required check. It fails on any meld-invalid (6 -> 0) or no-trap (9 -> 0) row. Negative control: a planted no-trap row fails the check. The pass target (36 -> at least 150) was falsified at planning: the imports commands need a component runtime for async/stream/thread builtins (#638), so it moves to v0.72 with P3. Plan: docs/plans/v0.71.0.md, bet 3."
     links:
       - type: derives-from
@@ -4257,7 +4257,7 @@ artifacts:
     type: sw-req
     title: "Stretch: fused shapes that are refused today are implemented, halving the refusals"
     status: draft
-    release: v0.73.0
+    release: v0.74.0
     description: "Serves North Star O1/O5 (summaries, indirectly; indicators unmoved). Driven by the refusal-reason histogram (bet 2a): refused 316 -> at most 160, with wrong and accepts-invalid not rising. Kill: if no single cause accounts for at least 40% of refusals, re-plan from the histogram. Plan: docs/plans/v0.71.0.md, bet 2b."
     links:
       - type: derives-from
@@ -4270,7 +4270,7 @@ artifacts:
     type: sw-req
     title: "Stretch: meld ships as a signed WASI component whose output matches native meld byte for byte"
     status: draft
-    release: v0.73.0
+    release: v0.74.0
     description: "Toward North Star O5 (does not count: the indicator needs kiln execution, blocked on kiln's WASI gap). meld is built for wasm32-wasip2, fused by meld, signed by wsc and published as meld.wasm (#539). CI requires byte-identical --reproducible output against native meld over the fixture corpus. Negative control: a one-byte-altered output fails the job. Kill: no wasip2 build without forking a dependency, or a slowdown above 10x. Plan: docs/plans/v0.71.0.md, bet 5a. UPDATE 2026-11-27 (v0.72.0 cut, owner decision): moved to v0.73.0. Delivered so far: #698 builds meld-cli for wasm32-wasip2 and requires byte-identical --reproducible output against native meld (five fixtures and meld itself, with planted controls); #700 ships meld-<tag>-wasm32-wasip2.wasm as a cosign-signed release asset. Remaining: meld.wasm fused by meld and signed by wsc."
     links:
       - type: derives-from
@@ -4283,7 +4283,7 @@ artifacts:
     type: sw-req
     title: "Stretch: a required synth static-data gate runs on a meld-fused composite"
     status: draft
-    release: v0.73.0
+    release: v0.74.0
     description: "Seam gate with synth (#479); no O1 claim, since there is no hardware run. Precondition, checked first: the gale inputs are usable in public CI. The gate runs pinned synth's VCR-VER-003 validation on a fused gale composite. Negative control: the meld 0.62.0 composite must fail it. Plan: docs/plans/v0.71.0.md, bet 5b."
     links:
       - type: derives-from
@@ -4338,7 +4338,7 @@ artifacts:
   - id: SR-142
     type: sw-req
     title: "meld adds no pulseengine:async imports to a fused module"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "Retires the P3 lowering pass (#693, ADR-10 section 6, ADR-1 amended). meld shall not add a pulseengine:async import for a canonical stream or future built-in: core modules reach those built-ins through their own producer-named imports, which pass through, and the added imports had no call site and no element-segment reference, yet a host had to bind every one of them. An input core module that imports pulseengine:async itself keeps that import."
     links:
@@ -4357,7 +4357,7 @@ artifacts:
   - id: SR-143
     type: sw-req
     title: "The default build writes the wsc-attestation Fusion schema at field parity"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "meld's default build shall write its attestation section in wsc-attestation 0.13's TransformationAttestation schema with transformation_type fusion (#709), so wsc reads it with its own types. The record shall carry every field the hand-written FusionAttestation records: every FusionParameters field under tool.parameters, every FusionMetadata field except parameters under metadata, and each input's module_count, component_type and prior attestation under metadata.inputs in input order. It is a conversion of the one FusionAttestation, not a second builder, so SR-28's exhaustive FuserConfig destructure covers both schemas. Under --reproducible the section shall stay byte-stable. Without the default attestation feature meld writes the hand-written schema."
     links:
@@ -4381,7 +4381,7 @@ artifacts:
   - id: SR-144
     type: sw-req
     title: "A fused module records each input by file name, never by directory"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "meld shall record each input in the attestation (inputs[].artifact.name) and in component-provenance (component_id) by the last component of the name the caller gave, split on / and \\ on every host, so no directory of the build machine reaches the fused module (#711). The input's sha256 identifies it; --reproducible keeps component-{i}. Before this, meld-cli passed the command-line path, so an absolute input path wrote the builder's home or volume directory into every fused module."
     links:
@@ -4399,7 +4399,7 @@ artifacts:
   - id: SR-145
     type: sw-req
     title: "--component exports the lifted function after replayed function aliases"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "In --component output, every component function the wrapper defines (lowers and lifts) shall be numbered after the component functions its depth-0 replay defines: func aliases in replayed alias sections and func imports that the internalised-import filter keeps (#485). Before this the wrapper counted from 0, so a source with (alias export $h \"log\" (func)) before its first core module exported run as the imported log; the output validated but wasmtime refused it."
     links:
