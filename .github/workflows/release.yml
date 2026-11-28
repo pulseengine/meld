@@ -424,7 +424,7 @@ jobs:
           } > release-assets/build-env.txt
           cat release-assets/build-env.txt
 
-      - name: Create or update GitHub Release
+      - name: Upload into the release (draft if new)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Untrusted-input safety: the tag name flows in via env: and is
@@ -433,16 +433,34 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
-          # Idempotent: re-running the workflow for an existing release
-          # uploads/overwrites assets rather than failing. --clobber lets
-          # a re-run replace assets a previous partial run left behind.
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "::notice::Release $VERSION exists; uploading assets"
-            gh release upload "$VERSION" --clobber release-assets/*
-          else
-            echo "::notice::Creating Release $VERSION with assets"
-            gh release create "$VERSION" \
-              --title "meld $VERSION" \
-              --generate-notes \
-              release-assets/*
+          # Find the release by listing every release, drafts included.
+          # `gh release view <tag>` resolves by tag, and that lookup missed
+          # the maintainer's draft for v0.70.0 and v0.72.0, so the old step
+          # created and PUBLISHED a second release before anyone verified
+          # the assets (#706).
+          # No `| head`: under pipefail a closed pipe would fail the step.
+          IDS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                 --jq ".[] | select(.tag_name == \"$VERSION\") | .id")
+          ID="${IDS%%$'\n'*}"
+          if [ -z "$ID" ]; then
+            # Never publish from here: publishing is the maintainer's step,
+            # after checksums, cosign and the binaries are verified (AGENTS.md).
+            echo "::notice::No release for $VERSION; creating a DRAFT"
+            ID=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+                   -f tag_name="$VERSION" -f name="meld $VERSION" \
+                   -F draft=true -F generate_release_notes=true --jq .id)
           fi
+          echo "::notice::Uploading into release id $ID (draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID" --jq .draft))"
+          for f in release-assets/*; do
+            name=$(basename "$f")
+            # Idempotent re-run: replace an asset a previous run left behind.
+            old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets?per_page=100" \
+                    --jq ".[] | select(.name == \"$name\") | .id")
+            if [ -n "$old" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+            fi
+            gh api -X POST \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=$name" \
+              -H "Content-Type: application/octet-stream" \
+              --input "$f" --jq .name
+          done

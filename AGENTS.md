@@ -840,9 +840,12 @@ GitHub REST API).
 
 4. **Create release**: Only after merge and main CI passes.
 
-   **Publish LAST, as a draft first.** `release.yml` creates the release itself
-   when it does not already exist; a manual `gh release create` right after the
-   tag push therefore publishes an EMPTY release that the pipeline fills minutes
+   **Publish LAST, as a draft first.** `release.yml` uploads into the release for
+   the tag, finding it by listing every release so a draft is found too, and
+   creates a DRAFT when there is none; it never publishes (#706: the old
+   by-tag lookup missed the draft for v0.70.0 and v0.72.0 and published a second
+   release). A manual `gh release create` without `--draft` right after the
+   tag push publishes an EMPTY release that the pipeline fills minutes
    later. Worse, `compliance.yml` triggers on `release: published`, so it fires
    immediately and uploads its report — which is how v0.53.0 came to sit public
    carrying one asset while a consumer fetched it (#395). On a busy runner fleet
