@@ -54,9 +54,10 @@ meld fuse --reproducible --memory multi -o fused.wasm app.wasm
 `--reproducible` derives the attestation id from the output's content and
 takes the timestamp from `SOURCE_DATE_EPOCH` (epoch 0 when unset) instead of a
 random UUID and the wall clock. It also replaces each attested input name with
-`component-0`, `component-1`, ..., since input paths differ between checkouts;
-the inputs stay pinned by their sha256. Without the flag, two runs differ in
-the attestation only.
+`component-0`, `component-1`, ..., since input names can differ between
+checkouts; the inputs stay pinned by their sha256. Without the flag, meld
+records each input by its file name, never its directory, and two runs
+differ in the attestation only.
 
 Name the memory strategy in the job. The default, `--memory auto`, always
 resolves to multi-memory; writing `--memory multi` states that in the job's

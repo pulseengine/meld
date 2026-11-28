@@ -30,12 +30,12 @@ commits:
 externals:
   kiln:
     git: https://github.com/pulseengine/kiln.git
-    path: /Volumes/Home/git/pulseengine/kiln
+    path: ../kiln
     ref: main
     prefix: kiln
 
   synth:
     git: https://github.com/pulseengine/synth.git
-    path: /Volumes/Home/git/pulseengine/synth
+    path: ../synth
     ref: main
     prefix: synth

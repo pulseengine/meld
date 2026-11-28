@@ -941,7 +941,14 @@ impl Fuser {
         self.add_component_named(bytes, None)
     }
 
-    /// Add a component with a name for better error messages
+    /// Add a component with a name, used in messages and recorded in the
+    /// attestation (`inputs[].artifact.name`) and `component-provenance`
+    /// (`component_id`).
+    ///
+    /// Only the last path component of `name` is kept (#711): a caller that
+    /// passes a file path would otherwise write its directory, often an
+    /// absolute home or volume path, into every fused module. The input's
+    /// sha256 identifies it. `--reproducible` records `component-{i}` instead.
     pub fn add_component_named(&mut self, bytes: &[u8], name: Option<&str>) -> Result<()> {
         self.add_component_with(&ComponentParser::new(), bytes, name)
     }
@@ -958,7 +965,7 @@ impl Fuser {
         let mut parsed = parser.parse(bytes)?;
 
         if let Some(n) = name {
-            parsed.name = Some(n.to_string());
+            parsed.name = Some(file_name_only(n).to_string());
         }
 
         self.original_components.push(parsed.clone());
@@ -4848,5 +4855,15 @@ mod tests {
             validate_output(&unchecked, false).is_err(),
             "with validation off the output should be the invalid module"
         );
+    }
+}
+
+/// The last component of `name`, split on `/` and `\` on every host, so the
+/// recorded name does not depend on the platform meld runs on (#711). A name
+/// with no separator, or one ending in a separator, is returned unchanged.
+pub(crate) fn file_name_only(name: &str) -> &str {
+    match name.rsplit(['/', '\\']).next() {
+        Some(last) if !last.is_empty() => last,
+        _ => name,
     }
 }
