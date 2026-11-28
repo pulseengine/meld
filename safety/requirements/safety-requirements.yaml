@@ -4396,3 +4396,22 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-28T09:00:00Z
+  - id: SR-145
+    type: sw-req
+    title: "--component exports the lifted function after replayed function aliases"
+    status: implemented
+    release: v0.73.0
+    description: "In --component output, every component function the wrapper defines (lowers and lifts) shall be numbered after the component functions its depth-0 replay defines: func aliases in replayed alias sections and func imports that the internalised-import filter keeps (#485). Before this the wrapper counted from 0, so a source with (alias export $h \"log\" (func)) before its first core module exported run as the imported log; the output validated but wasmtime refused it."
+    links:
+      - type: derives-from
+        target: SYS-4
+    fields:
+      verification-criteria: >
+        Fails if the #485 reproduction, fused with --component under
+        --memory multi or shared, does not instantiate under wasmtime with a
+        host log returning the string length, or if run returns anything but
+        5 (the unfused component's result).
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-28T10:00:00Z
