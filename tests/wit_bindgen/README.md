@@ -81,7 +81,11 @@ branch `feat/opaque-rep-attribute` (commit `51eca6b6` or later — the
 leaf's inner handle as the rep verbatim, skipping the `Box::into_raw` +
 `assume(ptr.is_aligned())` chain.
 
-The `.wasm` is **gitignored** (~11 MB build artifact); regenerate it:
+The committed `.wasm` has its DWARF sections removed (`wasm-tools strip -d '\.debug_.*'`,
+11.9 MB to 242 KB), and the three panic-location strings that named the
+builder's home directory are overwritten with a neutral path of the same length,
+so no fixture carries a local path (#711). To rebuild it, build with
+`--remap-path-prefix` for your home directory, then apply the same strip:
 
 ```bash
 git clone https://github.com/pulseengine/wit-bindgen /tmp/wit-bindgen-fork
@@ -97,5 +101,4 @@ cp /tmp/witbg-artifacts/resource_floats_opaque/composed-runner.rs-intermediate.r
 wit-bindgen-side opaque-rep destructor (no inner-handle forwarding); the
 fork's user-supplied dtor fixes it. With that fixture, meld fuses the chain
 **and `construct+drop` runs cleanly** (`test_runtime_wit_bindgen_resource_floats_opaque`)
-— no meld handle-table change was needed. The runtime test pins it; it skips
-in CI when the fixture is absent (the 11 MB artifact is not committed).
+— no meld handle-table change was needed. The runtime test pins it.

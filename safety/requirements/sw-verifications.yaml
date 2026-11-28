@@ -2239,3 +2239,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-28T08:00:00Z
+  - id: SWV-154
+    type: sw-verification
+    title: "Verification of SR-144: inputs recorded by file name"
+    status: implemented
+    release: v0.73.0
+    description: "meld-core/tests/input_file_name_711.rs fuses a provider/consumer pair with attestation and component-provenance on and --reproducible off, naming the inputs /private-build-root/nested/dir/provider.wasm and C:\\private-build-root\\nested\\consumer.wasm, and asserts that neither directory component appears anywhere in the fused bytes while both file names do. A control with bare file names records them unchanged. Potency: with the name recorded as given, the first test fails on private-build-root."
+    links:
+      - type: verifies
+        target: SR-144
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-28T09:00:00Z
