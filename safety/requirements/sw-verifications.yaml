@@ -2216,7 +2216,7 @@ artifacts:
   - id: SWV-152
     type: sw-verification
     title: "Verification of SR-142: meld adds no pulseengine:async imports"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "meld-core/tests/no_async_host_imports_693.rs fuses the two #662 stream fixtures and every wit-bindgen runtime fixture under --memory multi (61 inputs fuse; the refused ones are skipped). It checks that no input imports pulseengine:async itself and that no fused output does; stream_write_via_shim_wt1263.wat and simple-call-import.wasm must be among the fused inputs. p3_async_lowering.rs asserts the same for the stream<u8> and future<s32> fixtures. Negative control: with meld-core/src/lib.rs and p3_async.rs from main 763d1e4 the corpus test fails with 9 of 61 fused outputs importing pulseengine:async (stream_new..stream_drop_writable). The import-map golden for the #662 fixture lost its two pulseengine:async entries and is otherwise unchanged."
     links:
@@ -2229,7 +2229,7 @@ artifacts:
   - id: SWV-153
     type: sw-verification
     title: "Verification of SR-143: default build writes the wsc Fusion schema at parity"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "meld-core/tests/wsc_schema_709.rs fuses a composed component and a two-file provider/consumer pair with --reproducible and reads the attestation section back out of each fused artifact. default_build_writes_the_wsc_fusion_schema_at_parity deserializes it with wsc-attestation 0.13 (transformation_type fusion, one input per caller input), checks tool.parameters against the keys FusionParameters::default() serializes and metadata against the keys of the FusionAttestationBuilder record for the same output and stats (minus parameters), and checks that metadata.inputs gives a positive module_count per input summing to modules_merged. Both key sets are derived from meld's types, not listed in the test. wsc_schema_is_byte_stable_under_reproducible fuses each input twice and compares the sections byte for byte. attested_inputs_413.rs now checks the module counts in the wsc schema instead of skipping it."
     links:
@@ -2242,7 +2242,7 @@ artifacts:
   - id: SWV-154
     type: sw-verification
     title: "Verification of SR-144: inputs recorded by file name"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "meld-core/tests/input_file_name_711.rs fuses a provider/consumer pair with attestation and component-provenance on and --reproducible off, naming the inputs /private-build-root/nested/dir/provider.wasm and C:\\private-build-root\\nested\\consumer.wasm, and asserts that neither directory component appears anywhere in the fused bytes while both file names do. A control with bare file names records them unchanged. Potency: with the name recorded as given, the first test fails on private-build-root."
     links:
@@ -2255,7 +2255,7 @@ artifacts:
   - id: SWV-155
     type: sw-verification
     title: "Verification of SR-145: --component export index after replayed aliases"
-    status: implemented
+    status: verified
     release: v0.73.0
     description: "meld-core/tests/component_export_index_485.rs fuses the #485 reproduction (a component whose depth-0 prefix aliases log from an imported instance) with --component under --memory multi and shared, instantiates each output and the unfused source with wasmtime's component API and a host log that returns the string length, and asserts run returns 5 in all three. Potency: with the wrapper's function counter starting at 0 again, the multi-memory output fails to load with \"component export `run` is a reexport of an imported function which is not implemented\", the error reported in #485."
     links:

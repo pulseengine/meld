@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.73.0] - 2026-11-28
+
 ### Changed
 
 - A fused module records each input by file name only, in the attestation (`inputs[].artifact.name`) and in `component-provenance` (`component_id`) (#711). meld-cli passed the command-line path, so an absolute input path wrote the build machine's home or volume directory into every fused module unless `--reproducible` was set. The name is split on `/` and `\` on every host; `--reproducible` still records `component-{i}`.
