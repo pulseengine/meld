@@ -1362,7 +1362,7 @@ fn assemble_component(
     // In multi-memory mode, each regular import uses the memory and
     // cabi_realloc belonging to the component that originally imported it.
     // -----------------------------------------------------------------------
-    let mut component_func_idx = 0u32;
+    let mut component_func_idx = count_replayed_funcs(source, &dropped_import_names)?;
     let mut component_type_idx = count_replayed_types(source);
     let mut lowered_func_indices: Vec<u32> = Vec::new();
 
@@ -2612,6 +2612,64 @@ fn resolve_import_to_instance(
     }
 
     None
+}
+
+/// #485: how many component-level functions the depth-0 replay defines.
+///
+/// The replay copies the source's depth-0 alias and import sections, and
+/// each `func` alias or `func` import there takes a component function
+/// index. Every function the wrapper defines after it (lowers, lifts) starts
+/// after them. Counting from 0 instead made an export name the replayed alias
+/// one slot below its lift: with an `alias export $host "log" (func)` in the
+/// prefix, `run` was exported as the imported `log`.
+///
+/// Imports dropped by the internalised-import filter are not replayed and are
+/// not counted.
+fn count_replayed_funcs(
+    source: &ParsedComponent,
+    dropped_import_names: &std::collections::BTreeSet<String>,
+) -> Result<u32> {
+    let mut count = 0u32;
+    for (section_id, data) in &source.depth_0_sections {
+        if *section_id == wasm_encoder::ComponentSectionId::Alias as u8 {
+            let reader = wasmparser::ComponentAliasSectionReader::new(
+                wasmparser::BinaryReader::new(data, 0),
+            )
+            .map_err(|e| Error::EncodingError(format!("replay alias section: {e}")))?;
+            for alias in reader {
+                let alias = alias.map_err(|e| Error::EncodingError(format!("alias entry: {e}")))?;
+                let kind = match alias {
+                    wasmparser::ComponentAlias::InstanceExport { kind, .. } => kind,
+                    wasmparser::ComponentAlias::Outer { kind, .. } => match kind {
+                        wasmparser::ComponentOuterAliasKind::CoreModule
+                        | wasmparser::ComponentOuterAliasKind::CoreType
+                        | wasmparser::ComponentOuterAliasKind::Type
+                        | wasmparser::ComponentOuterAliasKind::Component => continue,
+                    },
+                    wasmparser::ComponentAlias::CoreInstanceExport { .. } => continue,
+                };
+                if kind == wasmparser::ComponentExternalKind::Func {
+                    count += 1;
+                }
+            }
+        } else if *section_id == wasm_encoder::ComponentSectionId::Import as u8 {
+            let reader = wasmparser::ComponentImportSectionReader::new(
+                wasmparser::BinaryReader::new(data, 0),
+            )
+            .map_err(|e| Error::EncodingError(format!("replay import section: {e}")))?;
+            for entry in reader {
+                let entry =
+                    entry.map_err(|e| Error::EncodingError(format!("import entry: {e}")))?;
+                if matches!(entry.ty, wasmparser::ComponentTypeRef::Func(_))
+                    && !dropped_import_names
+                        .contains(crate::parser::plain_extern_name(&entry.name)?)
+                {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Count total component-level types defined in the replayed depth_0_sections.

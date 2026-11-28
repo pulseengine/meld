@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
 - `release.yml` uploads into the release for the tag by listing all releases, drafts included, and creates a draft when none exists; it no longer publishes a release itself (#706). For v0.70.0 and v0.72.0 its by-tag lookup missed the maintainer's draft and it published a second release before the assets were verified.
 - meld no longer adds `pulseengine:async` imports for P3 stream and future built-ins (#693, ADR-10 section 6). No fused code called them: core modules reach those built-ins through their own producer-named imports. A host still had to bind all of them; kiln 0.7.3 listed 7 of them among the unresolved imports when it refused relay's falcon cascade. On the test corpus 9 of 61 fused outputs carried them (up to 6 each); now none do. The import map loses those entries; its schema and `version` are unchanged. An input module that imports `pulseengine:async` itself keeps that import.
 
+### Fixed
+
+- `--component` output exports the lifted function when the source component aliases a function from an imported instance before its first core module (#485). The wrapper replays those aliases but numbered its own functions from 0, so the export named the imported function one slot below the lift; the output validated, and wasmtime refused it ("component export `run` is a reexport of an imported function which is not implemented").
+
 ## [0.72.0] - 2026-11-27
 
 ### Added
