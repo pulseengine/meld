@@ -114,9 +114,10 @@ kiln --version
 timeout 300 kiln --wasi --component --dir . fused.wasm [guest args...]
 ```
 
-Put a timeout on the kiln run. kiln 0.9.0 can print nothing and never exit
-on x86_64 Linux for a larger fused tool that finishes in seconds on aarch64
-macOS (kiln#748; the fix, kiln#737, is merged and ships after 0.9.0).
+Use kiln 0.9.1 or later where you can. kiln 0.9.0 can print nothing and never
+exit on x86_64 Linux for a larger fused tool that finishes in seconds on
+aarch64 macOS; 0.9.1 fixes it (kiln#748, kiln#737). Keep the timeout while
+your varve layer still carries 0.9.0: covalent 2026.11.28 does.
 
 kiln's options go before the module and everything after it is the guest's
 argv, as with `wasmtime run`. For a `--memory multi` module whose host

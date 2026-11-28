@@ -285,6 +285,12 @@ jobs:
       - name: Run clippy (--all-features)
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      # #709: `attestation` is now a default feature, so neither run above
+      # compiles meld's own attestation schema, which a meld-core build
+      # without default features still writes. Lint that configuration too.
+      - name: Run clippy (meld-core, --no-default-features)
+        run: cargo clippy --locked -p meld-core --all-targets --no-default-features -- -D warnings
+
   fmt:
     name: Format
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","light"]') || 'ubuntu-24.04' }}

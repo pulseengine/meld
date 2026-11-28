@@ -467,6 +467,109 @@ impl FusionAttestation {
     }
 }
 
+/// #709: the same record in wsc-attestation's schema.
+///
+/// The `attestation` feature (a default feature) writes this instead of the
+/// hand-written schema above. It is a conversion, not a second builder: every
+/// field `FusionAttestationBuilder` records reaches the output, so SR-28's
+/// exhaustive `FuserConfig` destructure covers both schemas. Before #709 the
+/// wsc path was a hand-copied builder that recorded neither `profile`,
+/// `reproducible`, `pack_rebase`, `share_stack`, `domains` nor the per-input
+/// `module_count`, and called the transformation `composition`.
+///
+/// Mapping:
+/// - `transformation_type` is `Fusion` (wsc-attestation 0.13).
+/// - `FusionParameters` becomes `tool.parameters`, one key per field, with
+///   the same names and values.
+/// - `FusionMetadata` without `parameters` becomes `metadata`, one key per
+///   field.
+/// - The wsc `InputArtifact` has no module count, component type or prior
+///   attestation; `metadata.inputs` carries them, one entry per input in
+///   input order.
+/// - The attestation is unsigned, as before.
+#[cfg(feature = "attestation")]
+impl FusionAttestation {
+    /// Convert to wsc-attestation's `TransformationAttestation`.
+    pub fn to_wsc(&self) -> Result<wsc_attestation::TransformationAttestation, serde_json::Error> {
+        use serde_json::Value;
+        use std::collections::HashMap;
+        use wsc_attestation as wsc;
+
+        fn object(value: Value) -> HashMap<String, Value> {
+            match value {
+                Value::Object(map) => map.into_iter().collect(),
+                // Both inputs are structs, which serialize to objects.
+                _ => HashMap::new(),
+            }
+        }
+
+        let parameters = object(serde_json::to_value(&self.metadata.parameters)?);
+        let mut metadata = object(serde_json::to_value(&self.metadata)?);
+        // Recorded once, as `tool.parameters`.
+        metadata.remove("parameters");
+        let inputs_detail = self
+            .inputs
+            .iter()
+            .map(|input| {
+                let mut entry = serde_json::Map::new();
+                entry.insert("module_count".into(), input.module_count.into());
+                if let Some(t) = &input.component_type {
+                    entry.insert("component_type".into(), t.clone().into());
+                }
+                if let Some(prior) = &input.prior_attestation {
+                    entry.insert("prior_attestation".into(), (**prior).clone());
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        metadata.insert("inputs".into(), Value::Array(inputs_detail));
+
+        let descriptor = |a: &ArtifactDescriptor| wsc::ArtifactDescriptor {
+            name: a.name.clone(),
+            hash: a.hash.clone(),
+            size: a.size,
+        };
+
+        Ok(wsc::TransformationAttestation {
+            version: self.version.clone(),
+            transformation_type: wsc::TransformationType::Fusion,
+            attestation_id: self.attestation_id.clone(),
+            timestamp: self.timestamp.clone(),
+            output: descriptor(&self.output),
+            inputs: self
+                .inputs
+                .iter()
+                .map(|input| wsc::InputArtifact {
+                    artifact: descriptor(&input.artifact),
+                    signature_status: wsc::SignatureStatus::Unsigned,
+                    signature_info: None,
+                    provenance: None,
+                    transformation_chain: None,
+                })
+                .collect(),
+            tool: wsc::ToolInfo {
+                name: self.tool.name.clone(),
+                version: self.tool.version.clone(),
+                tool_hash: self.tool.tool_hash.clone(),
+                parameters,
+                toolchain: self.tool.toolchain.clone(),
+                toolchain_manifest_digest: self.tool.toolchain_manifest_digest.clone(),
+            },
+            attestation_signature: wsc::AttestationSignature {
+                algorithm: "unsigned".to_string(),
+                signature: String::new(),
+                key_id: None,
+                public_key: None,
+                signer_identity: None,
+                certificate_chain: None,
+                rekor_uuid: None,
+                signed_at: self.timestamp.clone(),
+            },
+            metadata,
+        })
+    }
+}
+
 /// Compute SHA-256 hash of bytes
 pub(crate) fn compute_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();

@@ -4354,3 +4354,27 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-27T19:00:00Z
+  - id: SR-143
+    type: sw-req
+    title: "The default build writes the wsc-attestation Fusion schema at field parity"
+    status: implemented
+    release: v0.73.0
+    description: "meld's default build shall write its attestation section in wsc-attestation 0.13's TransformationAttestation schema with transformation_type fusion (#709), so wsc reads it with its own types. The record shall carry every field the hand-written FusionAttestation records: every FusionParameters field under tool.parameters, every FusionMetadata field except parameters under metadata, and each input's module_count, component_type and prior attestation under metadata.inputs in input order. It is a conversion of the one FusionAttestation, not a second builder, so SR-28's exhaustive FuserConfig destructure covers both schemas. Under --reproducible the section shall stay byte-stable. Without the default attestation feature meld writes the hand-written schema."
+    links:
+      - type: derives-from
+        target: SYS-10
+      - type: refines
+        target: SR-28
+    fields:
+      verification-criteria: >
+        Fails if wsc-attestation 0.13 cannot deserialize the section of a
+        default-build fusion, if its transformation_type is not fusion, if a
+        FusionParameters key is missing from tool.parameters or a
+        FusionMetadata key other than parameters is missing from metadata,
+        if metadata.inputs does not give a positive module_count per input
+        summing to modules_merged, or if two reproducible fusions write
+        different sections.
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-28T08:00:00Z

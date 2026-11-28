@@ -60,14 +60,9 @@ fn fuse(profile: Profile, memory_strategy: MemoryStrategy) -> Result<Vec<u8>, St
         memory_strategy,
         // The byte-identity assertion below is about FUSION output, so strip the
         // attestation section from the comparison entirely rather than trying to
-        // tame it: `reproducible` removes the random id + wall clock, but under
-        // the optional `attestation` (wsc) feature the section also carries
-        // `HashMap` fields whose serialization ORDER meld cannot control from
-        // this side (a known, documented limitation — see
-        // `test_reproducible_attestation_is_byte_stable`, which is
-        // `cfg(not(feature = "attestation"))` for the same reason; the shipped
-        // default build has no such maps). With attestation off, this test is
-        // feature-independent AND compares exactly what it claims to.
+        // depend on it. With attestation off, this test compares exactly what it
+        // claims to; attestation reproducibility has its own test
+        // (`test_reproducible_attestation_is_byte_stable`).
         attestation: false,
         reproducible: true,
         ..Default::default()

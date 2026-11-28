@@ -36,8 +36,9 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-# Optional: wsc-attestation integration
-wsc-attestation = { version = "0.12", optional = true }
+# wsc-attestation schema for the attestation section (#709; the default
+# `attestation` feature). Without it meld writes its own equivalent schema.
+wsc-attestation = { version = "0.13", optional = true }
 petgraph = "0.8.3"
 
 [dev-dependencies]
@@ -98,7 +99,7 @@ ordeal = { version = "0.37.0", default-features = false }
 wasmtime-environ = { version = "=50.0.3", features = ["compile", "component-model"] }
 
 [features]
-default = []
+default = ["attestation"]
 # Enable wsc-attestation integration for supply chain tracking
 attestation = ["wsc-attestation"]
 # ADR-8: compile the wasmtime-environ differential-oracle test and the

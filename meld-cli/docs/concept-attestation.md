@@ -12,15 +12,18 @@ output content instead of a random UUID, and the timestamp is taken from
 inputs and flags then yield an identical sha256, so a rebuild can be checked
 against a published digest.
 
-This holds for the default build, which is what releases ship, and for builds with the
-optional `attestation` cargo feature. That path records the fusion parameters through
-`wsc-attestation`, whose parameter map is a `HashMap`. Before meld 0.68 its order
-changed from run to run, so two such builds of the same inputs had different digests.
-meld now writes those keys in sorted order.
+The record is written in the schema of `wsc-attestation` 0.13, the attestation types of
+sigil's `wsc`, with `transformation_type: "fusion"` (from v0.73.0, #709; earlier releases
+wrote meld's own schema). `tool.parameters` holds every fusion parameter (`profile`,
+`memory_strategy`, `reproducible`, `share_stack`, `domains`, ...); `metadata` holds the
+fusion statistics, the per-boundary and per-placement records, and `metadata.inputs`, one
+entry per input in input order with its `module_count`. wsc reads the record with its own
+types, and `wsc verify-chain` checks `output.hash` against the module.
 
-The two builds write different records, so their digests are not comparable with each
-other. A digest you produce with `--all-features` will not match one this project
-published, and that does not mean the artifact was tampered with. Compare like with like.
+The parameters and metadata are maps, and meld writes their keys in sorted order, so
+`--reproducible` stays byte-stable. A build of meld-core without its default `attestation`
+cargo feature writes meld's own schema with the same fields; its digests are not
+comparable with those of the default build.
 
 Under a varve shim, the `tool` object also names the toolchain layer meld ran from:
 `toolchain` (from `VARVE_LAYER`) and `toolchain_manifest_digest` (from

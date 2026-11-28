@@ -81,7 +81,6 @@ pub use merger::{MergedModule, Merger};
 pub use parser::{ComponentParser, ParsedComponent};
 pub use resolver::{DependencyGraph, Resolver};
 
-#[cfg(not(feature = "attestation"))]
 use crate::attestation::{FUSION_ATTESTATION_SECTION, FusionAttestationBuilder};
 use wasm_encoder::Module as EncodedModule;
 
@@ -3263,26 +3262,31 @@ impl Fuser {
         output_bytes: &[u8],
         stats: &FusionStats,
     ) -> Result<(&'static str, Vec<u8>)> {
+        let attestation = self.build_attestation(output_bytes, stats);
+        // #709: with the `attestation` feature (a default feature) the record
+        // is written in wsc-attestation's schema, as a conversion of the same
+        // `FusionAttestation`, so the two schemas cannot record different
+        // fields.
         #[cfg(feature = "attestation")]
         {
-            let attestation = self.build_wsc_attestation(output_bytes, stats);
             // Through `serde_json::Value`, not `to_json_compact`: wsc's
             // `ToolInfo::parameters` is a `HashMap`, serialized in per-process
             // hash order, so `--reproducible` gave different bytes on every
             // run in this build. `Value`'s map is a BTreeMap (serde_json is
             // built without `preserve_order`), so keys come out sorted.
             // Found by SR-116's reproducibility test.
-            let payload = serde_json::to_value(&attestation)
+            let payload = attestation
+                .to_wsc()
+                .and_then(|w| serde_json::to_value(&w))
                 .and_then(|v| serde_json::to_vec(&v))
                 .map_err(|e| {
                     Error::EncodingError(format!("attestation serialization failed: {e}"))
                 })?;
-            Ok((wsc_attestation::TRANSFORMATION_ATTESTATION_SECTION, payload))
+            Ok((FUSION_ATTESTATION_SECTION, payload))
         }
 
         #[cfg(not(feature = "attestation"))]
         {
-            let attestation = self.build_attestation(output_bytes, stats);
             let bytes = attestation.to_bytes().map_err(|e| {
                 Error::EncodingError(format!("attestation serialization failed: {e}"))
             })?;
@@ -3324,7 +3328,6 @@ impl Fuser {
             .collect()
     }
 
-    #[cfg(not(feature = "attestation"))]
     fn build_attestation(
         &self,
         output_bytes: &[u8],
@@ -3344,177 +3347,7 @@ impl Fuser {
         builder.build(output_bytes, stats)
     }
 
-    #[cfg(feature = "attestation")]
-    fn build_wsc_attestation(
-        &self,
-        output_bytes: &[u8],
-        stats: &FusionStats,
-    ) -> wsc_attestation::TransformationAttestation {
-        use std::collections::HashMap;
-        use wsc_attestation::{
-            ArtifactDescriptor, AttestationSignature, InputArtifact, SignatureStatus, ToolInfo,
-            TransformationAttestation, TransformationType,
-        };
-
-        let output_hash = attestation::compute_sha256(output_bytes);
-        let toolchain = if self.config.reproducible {
-            attestation::ToolchainIdentity::default()
-        } else {
-            attestation::toolchain_identity_from_env()
-        };
-        // #325: in reproducible mode, derive the id from the output content and
-        // the timestamp from SOURCE_DATE_EPOCH so the fused artifact is
-        // byte-stable across runs; otherwise keep the wall-clock/random id.
-        let (timestamp, attestation_id) = if self.config.reproducible {
-            (
-                attestation::chrono_timestamp_from(attestation::source_date_epoch()),
-                attestation::generate_uuid_from(attestation::entropy_from_hex(&output_hash)),
-            )
-        } else {
-            (
-                attestation::chrono_timestamp(),
-                attestation::generate_uuid(),
-            )
-        };
-
-        let mut inputs = Vec::new();
-        // #341 / #413: see `attested_inputs`. The wsc schema carries no module
-        // count, so only name, hash and size are used here.
-        for (name, _module_count, hash, size) in self.attested_inputs() {
-            inputs.push(InputArtifact {
-                artifact: ArtifactDescriptor { name, hash, size },
-                signature_status: SignatureStatus::Unsigned,
-                signature_info: None,
-                provenance: None,
-                transformation_chain: None,
-            });
-        }
-
-        let mut tool_parameters = HashMap::new();
-        tool_parameters.insert(
-            "memory_strategy".to_string(),
-            serde_json::json!(self.memory_strategy_label()),
-        );
-        tool_parameters.insert(
-            "address_rebasing".to_string(),
-            serde_json::json!(self.config.address_rebasing),
-        );
-        tool_parameters.insert(
-            "preserve_names".to_string(),
-            serde_json::json!(self.config.preserve_names),
-        );
-        tool_parameters.insert(
-            "custom_sections".to_string(),
-            serde_json::json!(self.custom_sections_label()),
-        );
-        tool_parameters.insert(
-            "dwarf_handling".to_string(),
-            serde_json::json!(self.dwarf_handling_label()),
-        );
-        tool_parameters.insert(
-            "output_format".to_string(),
-            serde_json::json!(self.output_format_label()),
-        );
-        // #463: recorded only when not the default, so default records stay
-        // byte-identical (same rule as `attestation_parameters`).
-        let (wsc_policy, wsc_page_size) = wsc_recorded_optionals(&self.config);
-        if let Some(policy) = wsc_policy {
-            tool_parameters.insert("exports".to_string(), serde_json::json!(policy));
-        }
-        if let Some(page_size) = wsc_page_size {
-            tool_parameters.insert("memory_page_size".to_string(), serde_json::json!(page_size));
-        }
-
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "memory_strategy".to_string(),
-            serde_json::json!(self.memory_strategy_label()),
-        );
-        metadata.insert(
-            "components_fused".to_string(),
-            serde_json::json!(stats.components_fused),
-        );
-        metadata.insert(
-            "modules_merged".to_string(),
-            serde_json::json!(stats.modules_merged),
-        );
-        metadata.insert(
-            "adapters_generated".to_string(),
-            serde_json::json!(stats.adapter_functions),
-        );
-        metadata.insert(
-            "imports_resolved".to_string(),
-            serde_json::json!(stats.imports_resolved),
-        );
-        // ADR-7 per-boundary records — kept in step with the default
-        // `build_attestation` path (the two are hand-duplicated, so a field
-        // added to one must be added to the other or the wsc build silently
-        // drops it). The records themselves serialize deterministically (a Vec
-        // in sorted `adapter_sites` order); the surrounding wsc `metadata` map
-        // is the already-documented non-reproducible part of this path.
-        metadata.insert(
-            "boundaries".to_string(),
-            serde_json::json!(stats.boundaries),
-        );
-        metadata.insert(
-            "placements".to_string(),
-            serde_json::json!(stats.placements),
-        );
-        if let Some(t) = &stats.thread_table {
-            metadata.insert("thread_table".to_string(), serde_json::json!(t));
-        }
-        // 0.0 for a zero-size input keeps the recorded value unchanged (#414);
-        // no parseable input is zero bytes.
-        let size_reduction =
-            size_reduction_percent(stats.input_size, stats.output_size).unwrap_or(0.0);
-        metadata.insert(
-            "size_reduction_percent".to_string(),
-            serde_json::json!(size_reduction),
-        );
-
-        TransformationAttestation {
-            version: "1.0".to_string(),
-            transformation_type: TransformationType::Composition,
-            attestation_id,
-            timestamp: timestamp.clone(),
-            output: ArtifactDescriptor {
-                name: "fused.wasm".to_string(),
-                hash: output_hash,
-                size: output_bytes.len() as u64,
-            },
-            inputs,
-            tool: ToolInfo {
-                name: "meld".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                tool_hash: None,
-                parameters: tool_parameters,
-                // SR-116: the varve layer identity, by the same predicate as
-                // the default attestation path, and likewise left out under
-                // --reproducible.
-                toolchain: toolchain.layer,
-                toolchain_manifest_digest: toolchain.manifest_digest,
-            },
-            attestation_signature: AttestationSignature {
-                algorithm: "unsigned".to_string(),
-                signature: String::new(),
-                key_id: None,
-                public_key: None,
-                signer_identity: None,
-                certificate_chain: None,
-                rekor_uuid: None,
-                signed_at: timestamp,
-            },
-            metadata,
-        }
-    }
-
     /// SR-28: the ADR-7 profile as an attestation label.
-    ///
-    /// Gated like its only caller, `build_attestation`. Without the gate
-    /// `clippy --all-features` reports this and `attestation_parameters` as
-    /// never used and fails — which nothing noticed, because no CI job ran
-    /// clippy with the feature on (#408).
-    #[cfg(not(feature = "attestation"))]
     fn profile_label(&self) -> &'static str {
         match self.config.profile {
             Profile::Ecosystem => "ecosystem",
@@ -3525,7 +3358,6 @@ impl Fuser {
     /// SR-28: the build configuration, recorded so an auditor holding only the
     /// artifact can reconstruct how it was fused. Typed (not a map) so the JSON
     /// key order is deterministic under `--reproducible`.
-    #[cfg(not(feature = "attestation"))]
     fn attestation_parameters(&self) -> attestation::FusionParameters {
         // SR-28 completeness, enforced by the COMPILER rather than by a test
         // that can drift: this destructure is exhaustive (no `..`), so adding a
@@ -3635,49 +3467,6 @@ impl Fuser {
             OutputFormat::Component => "component",
         }
     }
-}
-
-/// SR-28 for the wsc-attestation build: the exhaustive `FuserConfig`
-/// destructure the default path has in `attestation_parameters`, so a field
-/// added to the config fails to compile under `--features attestation` until it
-/// is recorded or acknowledged here. Returns the export policy when it is not
-/// the default.
-///
-/// Fields bound to `_` below are NOT recorded by this path today (it predates
-/// the typed `FusionParameters`); they are acknowledged, not endorsed.
-#[cfg(feature = "attestation")]
-fn wsc_recorded_optionals(config: &FuserConfig) -> (Option<&'static str>, Option<u32>) {
-    let FuserConfig {
-        // Already recorded by `build_wsc_attestation`.
-        memory_strategy: _,
-        address_rebasing: _,
-        preserve_names: _,
-        custom_sections: _,
-        dwarf_handling: _,
-        output_format: _,
-        // Not recorded by this path (recorded by the default path).
-        profile: _,
-        reproducible: _,
-        pack_rebase: _,
-        share_stack: _,
-        domains: _,
-        // Not build parameters (see `attestation_parameters`).
-        attestation: _,
-        component_provenance: _,
-        signature_manifest: _,
-        opaque_resources: _,
-        async_bounds: _,
-        // #463.
-        export_policy,
-        // SR-107 / #530.
-        memory_page_size,
-        // #545: not a build parameter (see `attestation_parameters`).
-        validate_output: _,
-    } = config;
-    (
-        (*export_policy != ExportPolicy::All).then(|| export_policy.as_str()),
-        (*memory_page_size != MemoryPageSize::Page).then(|| memory_page_size.bytes()),
-    )
 }
 
 /// Recursively flatten nested sub-components into a flat `Vec<ParsedComponent>`.

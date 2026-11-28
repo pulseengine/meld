@@ -2226,3 +2226,16 @@ artifacts:
       created-by: ai-assisted
       model: claude-opus-5-5
       timestamp: 2026-11-27T19:00:00Z
+  - id: SWV-153
+    type: sw-verification
+    title: "Verification of SR-143: default build writes the wsc Fusion schema at parity"
+    status: implemented
+    release: v0.73.0
+    description: "meld-core/tests/wsc_schema_709.rs fuses a composed component and a two-file provider/consumer pair with --reproducible and reads the attestation section back out of each fused artifact. default_build_writes_the_wsc_fusion_schema_at_parity deserializes it with wsc-attestation 0.13 (transformation_type fusion, one input per caller input), checks tool.parameters against the keys FusionParameters::default() serializes and metadata against the keys of the FusionAttestationBuilder record for the same output and stats (minus parameters), and checks that metadata.inputs gives a positive module_count per input summing to modules_merged. Both key sets are derived from meld's types, not listed in the test. wsc_schema_is_byte_stable_under_reproducible fuses each input twice and compares the sections byte for byte. attested_inputs_413.rs now checks the module counts in the wsc schema instead of skipping it."
+    links:
+      - type: verifies
+        target: SR-143
+    provenance:
+      created-by: ai-assisted
+      model: claude-opus-5-5
+      timestamp: 2026-11-28T08:00:00Z

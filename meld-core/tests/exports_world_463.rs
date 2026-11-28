@@ -507,24 +507,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Default build: the typed `FusionParameters` record.
-#[cfg(not(feature = "attestation"))]
+/// Both schemas record it from the typed `FusionParameters` (one builder since
+/// #709).
 #[test]
 fn the_attestation_records_the_export_policy_only_when_set() {
-    assert!(contains(
-        &attested(ExportPolicy::World),
-        br#""exports":"world""#
-    ));
-    assert!(!contains(
-        &attested(ExportPolicy::All),
-        br#""exports":"world""#
-    ));
-}
-
-/// wsc-attestation build: a separate builder, which must record it too.
-#[cfg(feature = "attestation")]
-#[test]
-fn the_wsc_attestation_records_the_export_policy_only_when_set() {
     assert!(contains(
         &attested(ExportPolicy::World),
         br#""exports":"world""#
