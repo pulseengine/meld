@@ -414,7 +414,7 @@ pub enum SyntheticKind {
     /// Cross-component stream-bridge shim (#141): per-component
     /// `stream_*` dispatch function emitted by `crate::p3_bridge` that
     /// routes locally-minted (bit-31-tagged) handles to the in-module
-    /// bridge ring memory and forwards host handles to the retained
+    /// bridge ring memory and forwards host handles to the input's own
     /// `pulseengine:async` imports.
     StreamBridge,
     /// ADR-10 step 3: an async edge's start or return adapter (`crate::async_edges`).
@@ -432,7 +432,7 @@ pub struct MergedGlobal {
     /// `Some(f)` when `init_expr` is exactly `ref.func f` (a fused function
     /// index). `init_expr` is an opaque `ConstExpr`, so this records the target
     /// in structured form, as `ReindexedElementItems` does for element
-    /// segments, letting `p3_async::shift_function_indices` move it (#482).
+    /// segments, so a pass that moves function indices can move it (#482).
     pub init_ref_func: Option<u32>,
     /// The `(component, module, module-local function index)` that
     /// `init_ref_func` was resolved from. [`MergedModule::refresh_global_ref_funcs`]

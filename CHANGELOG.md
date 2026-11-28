@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- meld no longer adds `pulseengine:async` imports for P3 stream and future built-ins (#693, ADR-10 section 6). No fused code called them: core modules reach those built-ins through their own producer-named imports. A host still had to bind all of them; kiln 0.7.3 listed 7 of them among the unresolved imports when it refused relay's falcon cascade. On the test corpus 9 of 61 fused outputs carried them (up to 6 each); now none do. The import map loses those entries; its schema and `version` are unchanged. An input module that imports `pulseengine:async` itself keeps that import.
+
 ## [0.72.0] - 2026-11-27
 
 ### Added

@@ -38,38 +38,6 @@
       "module": "[export]test:x/api",
       "name": "[async-lower][stream-write-0]get",
       "realloc": null
-    },
-    {
-      "component": null,
-      "encoding": {
-        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
-      },
-      "index": 2,
-      "kind": "function",
-      "memory": {
-        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
-      },
-      "module": "pulseengine:async",
-      "name": "stream_new",
-      "realloc": {
-        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
-      }
-    },
-    {
-      "component": null,
-      "encoding": {
-        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
-      },
-      "index": 3,
-      "kind": "function",
-      "memory": {
-        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
-      },
-      "module": "pulseengine:async",
-      "name": "stream_write",
-      "realloc": {
-        "unknown": "not a canon lower (a synthesized builtin); its options are not recorded"
-      }
     }
   ],
   "version": 2

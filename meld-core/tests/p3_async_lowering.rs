@@ -9,11 +9,10 @@
 //! 3. End-to-end fusion — a synthetic component using `stream<u8>` parses
 //!    and is summarised correctly via `Fuser::p3_async_summary`.
 //!
-//! The actual lowering pass that rewrites `(canon stream.new)` to
-//! `(import "pulseengine:async" "stream_new" ...)` calls in the fused
-//! output is **deferred** to a follow-up PR (see ADR-1). This file is
-//! deliberately scoped to the foundation layer so that lowering can be
-//! added incrementally without changing the ABI contract or detection API.
+//! meld no longer lowers `(canon stream.new)` and friends to
+//! `pulseengine:async` imports (#693, ADR-10 section 6): no fused code
+//! called those imports, yet every host had to bind them. The fusion tests
+//! below assert that none are emitted.
 
 use meld_core::p3_async::{HOST_INTRINSIC_MODULE, HostIntrinsic, P3AsyncFeatures, callback, event};
 use meld_core::{Fuser, FuserConfig};
@@ -212,16 +211,10 @@ fn stream_u8_component_detected_end_to_end() {
 // Lowering pass: stream<u8> emits pulseengine:async imports (issue #120)
 // ---------------------------------------------------------------------------
 
-/// After `Fuser::fuse()`, the `stream<u8>` fixture's import section must
-/// contain entries under module `pulseengine:async` whose names exactly
-/// match the [`HostIntrinsic`] set returned by `p3_async_summary()`.
-///
-/// This is the acceptance test for issue #120 (lowering pass) — the
-/// foundation PR (#94) only ships detection; this PR rewrites the
-/// component-level `(canon stream.*)` built-ins into core-module
-/// imports.
+/// #693: the `stream<u8>` fixture declares stream intrinsics, and the fused
+/// module must still import nothing under `pulseengine:async`.
 #[test]
-fn stream_u8_lowering_emits_pulseengine_async_imports() {
+fn stream_u8_fusion_emits_no_pulseengine_async_imports() {
     let wat_src = build_stream_u8_component_wat();
     let bytes = match wat::parse_str(wat_src) {
         Ok(b) => b,
@@ -251,14 +244,11 @@ fn stream_u8_lowering_emits_pulseengine_async_imports() {
         "fixture should declare at least one P3 async intrinsic"
     );
 
-    // Fuse and inspect the import section.
     let fused = fuser.fuse().expect("fuse should succeed");
-    let imports_under_pulseengine_async = collect_pulseengine_async_imports(&fused);
-
     assert_eq!(
-        imports_under_pulseengine_async, expected_names,
-        "lowering pass must emit one import per detected intrinsic; \
-         got {imports_under_pulseengine_async:?}, expected {expected_names:?}"
+        collect_pulseengine_async_imports(&fused),
+        Vec::<String>::new(),
+        "no pulseengine:async import may be emitted (#693)"
     );
 }
 
@@ -293,11 +283,9 @@ fn build_future_s32_component_wat() -> &'static str {
 "#
 }
 
-/// Fuse-only acceptance test for `future<T>`: same shape as the
-/// stream<u8> assertion, but exercises the symmetric `future_*` half of
-/// the host-intrinsic ABI.
+/// #693: the `future<T>` half of the stream<u8> test above.
 #[test]
-fn future_s32_lowering_emits_pulseengine_async_imports() {
+fn future_s32_fusion_emits_no_pulseengine_async_imports() {
     let wat_src = build_future_s32_component_wat();
     let bytes = match wat::parse_str(wat_src) {
         Ok(b) => b,
@@ -332,28 +320,12 @@ fn future_s32_lowering_emits_pulseengine_async_imports() {
         feats.required_intrinsics
     );
 
-    let mut expected_names: Vec<String> = feats
-        .required_intrinsics
-        .iter()
-        .map(|i| i.name().to_string())
-        .collect();
-    expected_names.sort();
-
     let fused = fuser.fuse().expect("fuse should succeed");
-    let imports_under_pulseengine_async = collect_pulseengine_async_imports(&fused);
-
     assert_eq!(
-        imports_under_pulseengine_async, expected_names,
-        "lowering pass must emit one import per detected future intrinsic"
+        collect_pulseengine_async_imports(&fused),
+        Vec::<String>::new(),
+        "no pulseengine:async import may be emitted (#693)"
     );
-
-    // Spot-check: every emitted name must actually be a future_* intrinsic.
-    for name in &imports_under_pulseengine_async {
-        assert!(
-            name.starts_with("future_"),
-            "future fixture must only emit future_* intrinsics, got '{name}'"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +610,12 @@ fn async_callback_trampoline_shape_canonical() {
 
 // ---------------------------------------------------------------------------
 // Regression: expression-form element-segment ref.func relocation under the
-// P3-async function-index shift (fix/p3-elem-expr-reffunc).
+// P3-async function-index shift (fix/p3-elem-expr-reffunc, LS-M-9).
+//
+// #693 retired the lowering pass and its shift, so nothing is prepended any
+// more. The test keeps the end-to-end property: in a fused P3 component the
+// elem ref.func equals `$b`'s exported index. Bringing back a prepend that
+// forgets this reference site fails it again.
 //
 // `shift_function_indices` prepends `k` `pulseengine:async` function imports
 // and bumps every defined-function reference up by `k`. The
@@ -751,15 +728,9 @@ fn ls_m_9_p3_shift_relocates_expr_form_elem_ref_func() {
         .add_component_named(&bytes, Some("stream-u8-expr-elem"))
         .expect("parser should accept the P3 component");
 
-    // Sanity: this fixture must actually trigger a non-zero shift, i.e. some
-    // pulseengine:async imports get prepended. Otherwise the test is vacuous.
+    // #693: no pulseengine:async import is prepended any more.
     let fused = fuser.fuse().expect("fuse should succeed");
-    let k = collect_pulseengine_async_imports(&fused).len();
-    assert!(
-        k > 0,
-        "fixture must prepend at least one pulseengine:async import to \
-         exercise the shift; got {k}"
-    );
+    assert_eq!(collect_pulseengine_async_imports(&fused).len(), 0);
 
     let b_idx = func_export_index(&fused, "b").expect("fused core module must export function `b`");
     let elem_refs = elem_expr_ref_func_indices(&fused);
